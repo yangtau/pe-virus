@@ -1,0 +1,12 @@
+机器码                     汇编
+6A 00                    | push 0                                  |
+68 00304000              | push hello.403000                       | 403000:"System Information"
+68 00304000              | push hello.403000                       | 403000:"System Information"
+6A 00                    | push 0                                  |
+FF15 08204000            | call dword ptr ds:[<&MessageBoxA>]      | 0x00402008
+6A 00                    | push 0                                  |
+FF15 00204000            | call dword ptr ds:[<&ExitProcess>]      |
+CC                       | int3                                    |
+
+replace hello.exe 0 0x40  6A 00 68 00 30 40 00 68 00 30 40 00 6A 00 FF 15 08 20 40 00 6A 00 FF 15 00 20 40 00 CC
+ep hello.exe 0x1040
