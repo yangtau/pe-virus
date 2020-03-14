@@ -5,9 +5,10 @@ PE (Portal Executable) 是 Windows 平台下可执行文件的格式。在本次
 下面是我本次实验中使用到的一些工具：
 
 1. Python 
-2. MASM32
-3. CCF PE Explorer，这个工具可以快捷地查看 PE 的信息，并反汇编二进制代码。只将其作为查看器使用，不使用修改功能。
-4. x32dbg，PE 文件动态调试工具。
+2. pefile，一个 PE 文件解析的 Python 库。只使用其查看信息的功能，不使用别的功能。
+3. MASM32
+4. CCF PE Explorer，这个工具可以快捷地查看 PE 的信息，并反汇编二进制代码。只将其作为查看器使用，不使用修改功能。
+5. x32dbg，PE 文件动态调试工具。
 
 下面，我会先简单介绍 PE 可执行文件的格式，然后展示实验内容。
 
@@ -103,7 +104,122 @@ PE 文件之后的内容就是各个 section 的二进制文件的内容。
 
 ## 实验内容
 
+这次实验的具体对象是一个弹出两个窗口的小程序，其 masm32 汇编代码如下：
+
+```asm
+.386
+.model flat, stdcall
+option casemap:none
+
+include /masm32/include/windows.inc
+include /masm32/include/user32.inc
+include /masm32/include/kernel32.inc
+includelib /masm32/lib/user32.lib
+includelib /masm32/lib/kernel32.lib
+
+.data
+szCaption1 db "System Information", 0
+szCaption2 db "System Information", 0
+szText1    db "Hello, World!", 0
+szText2    db "Destroy!", 0
+.code
+start:
+	invoke MessageBox, NULL, offset szText1, offset szCaption1, MB_OK
+	invoke MessageBox, NULL, offset szText2, offset szCaption2, MB_OK
+	invoke ExitProcess, NULL
+end start
+```
+
+使用 masm32 编译上面的代码片段，然后 link，就得到了一个 `.exe` 的可执行文件。运行这个程序，会在弹出两个窗口之后就结束运行。
+
+我们可以使用 `python3 pe.py show hello.exe [option]` 查看一下该 PE 文件的信息。
+
+使用命令 `python3 pe.py show hello.exe optional_header` 查看 Optional Header 的信息，可以看到程序的入口地址是 `0x1000`，虚拟内存的加载基地址是 `0x400000`，还有一些其他的信息。
+
+```
+[IMAGE_OPTIONAL_HEADER]
+...
+0xD8       0x10  AddressOfEntryPoint:           0x1000
+0xDC       0x14  BaseOfCode:                    0x1000
+0xE0       0x18  BaseOfData:                    0x2000
+0xE4       0x1C  ImageBase:                     0x400000
+0xE8       0x20  SectionAlignment:              0x1000
+0xEC       0x24  FileAlignment:                 0x200
+...
+0x100      0x38  SizeOfImage:                   0x4000
+0x104      0x3C  SizeOfHeaders:                 0x400
+...
+```
+
+使用 `python3 pe.py show hello.exe .text` 查看 `.text` 段的 section header 的内容：
+
+```
+[IMAGE_SECTION_HEADER]
+0x1A8      0x0   Name:                          .text
+0x1B0      0x8   Misc:                          0x3A
+0x1B0      0x8   Misc_PhysicalAddress:          0x3A
+0x1B0      0x8   Misc_VirtualSize:              0x3A
+0x1B4      0xC   VirtualAddress:                0x1000
+0x1B8      0x10  SizeOfRawData:                 0x200
+0x1BC      0x14  PointerToRawData:              0x400
+0x1C0      0x18  PointerToRelocations:          0x0
+0x1C4      0x1C  PointerToLinenumbers:          0x0
+0x1C8      0x20  NumberOfRelocations:           0x0
+0x1CA      0x22  NumberOfLinenumbers:           0x0
+0x1CC      0x24  Characteristics:               0x60000020
+```
+
+下面我会依次阐述我所做的四个关于 PE 文件的病毒实验，分别为修改程序入口地址、在已有的 section 中注入代码、添加一个新的 section、实现新的 section 中代码的运行时变形。
+
 ### 入口地址修改
+
+入口地址的修改比较简单，直接在 optional header 中修改相应位置的值即可。比修改更为重要的问题是找到想要修改的入口地址的位置。这里，我们需要使用将二进制代码 disassemble 到汇编代码，以便于选取合适的位置。其实对于 x86 这样的不需要代码对齐的复杂指令集，还可以将自己想要执行的指令编译成二进制代码，然后在文件中查找是否有相应的二进制片段。下面我使用 PE Explorer 查看 `.text` 节的汇编代码：
+
+```assembly
+L_00000000:   push 0x0
+L_00000002:   push 0x403000
+L_00000007:   push 0x403026
+L_0000000C:   push 0x0
+L_0000000E:   call 0x2e
+L_00000013:   push 0x0          <= 第一个窗口函数调用结束的位置
+L_00000015:   push 0x403013
+L_0000001A:   push 0x403034
+L_0000001F:   push 0x0
+L_00000021:   call 0x2e
+L_00000026:   push 0x0
+L_00000028:   call 0x34
+L_0000002D:   int 3 
+L_0000002E:   jmp [0x402008]
+L_00000034:   jmp [0x402000]
+```
+
+可以看到，这段汇编代码的功能就是调用了三个函数。我们可以大胆的推测前两个函数正好对应着前两个窗口。我们现在把入口地址修改到打开第二个窗口的地方，也就是相对偏移为 `0x13`的位置。注意到 `.text` 节加载到虚拟内存的相对地址为 `0x1000`, 所以我们可以将入口地址修改到 `0x1013`。
+
+下面使用 `python3 pe.py ep hello.exe 0x1013`，输出:
+
+```
+old address of entry point: 0x1000
+new address of entry point: 0x1013
+```
+
+修改工作可能成功了，再次运行 `hello.exe` 文件，可以看到，第一个显示 “Hello World!”的窗口已经被跳过了。
+
+下面是修改入口地址的 Python 脚本的节选：
+
+```python
+def change_entry_point(filename: str, new_entry_point: int):
+    with open(filename, "r+b") as f:
+        fdno = f.fileno()
+        data = mmap.mmap(fdno, 0)
+        optional_header = get_optional_header(data)
+        print("old address of entry point: %s" %
+              (hex(optional_header[IDX_ENTRY_POINT])))
+        optional_header[IDX_ENTRY_POINT] = new_entry_point
+        set_optional_header(data, optional_header)
+        print("new address of entry point: %s" % (hex(new_entry_point)))
+```
+
+这段代码的逻辑比较简单，首先获取 optional header，然后修改 entry point，最后将 optional header 写回即可。
 
 ### 在已有节注入代码
 
